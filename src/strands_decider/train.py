@@ -31,7 +31,7 @@ from . import distributed
 from .data.collate import CollatorConfig, SystemOneCollator
 from .data.format import Example, load_examples, split_examples
 from .data.sampling import LengthGroupedBatchSampler, example_length, padding_fraction
-from .modeling import StrandsDeciderConfig, StrandsDeciderModel
+from .modeling import StrandsDeciderConfig, StrandsDeciderModel, build_head
 
 
 @dataclass
@@ -266,14 +266,8 @@ def _frozen_reference(model: StrandsDeciderModel, examples: list[Example], batch
     return ref
 
 
-@distributed.entry_point  # under torchrun, this process is one rank of the run
-def train(cfg: TrainConfig) -> str:
-    rank, _, world = distributed.env()
-    torch.manual_seed(cfg.seed)
-    random.seed(cfg.seed)
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-
-    print(f"[strands-decider] loading base model {cfg.base_model}")
+def _build_model(cfg: TrainConfig) -> StrandsDeciderModel:
+    """Build the training model, optionally continuing from a saved torso."""
     model_cfg = StrandsDeciderConfig(
         base_model=cfg.base_model,
         num_slots=cfg.num_slots,
@@ -293,15 +287,23 @@ def train(cfg: TrainConfig) -> str:
     )
     if cfg.lora_targets:
         model_cfg.lora_targets = list(cfg.lora_targets)
-    if cfg.init_from:
-        from .modeling import SlotHead
+    if cfg.head_init == "lm_head":
+        # Fail before loading a checkpoint or base model when the requested readout
+        # cannot be seeded from LM output rows.
+        model_cfg.validate_lm_head_init()
 
+    if cfg.init_from:
         print(f"[strands-decider] loading torso + adapter from {cfg.init_from}")
         model = StrandsDeciderModel.load(cfg.init_from, attn_implementation=cfg.attn_implementation)
         # Swap in a fresh head of the requested shape; the loaded one is discarded so
-        # that head capacity is the only thing differing between arms.
+        # that head capacity is the only thing differing between arms. Keep the loaded
+        # torso/adapter settings while synchronizing every readout setting with the new head.
+        model.config.num_slots = cfg.num_slots
+        model.config.head_type = cfg.head_type
+        model.config.pointer_dim = cfg.pointer_dim
         model.config.head_hidden = cfg.head_hidden
         model.config.head_dropout = cfg.head_dropout
+        model.config.head_init = cfg.head_init
         model.config.ordinal_smoothing = cfg.ordinal_smoothing
         # Any calibration stored on the source checkpoint describes its old head and
         # is meaningless for a fresh one. Left in place it would be applied during
@@ -309,12 +311,7 @@ def train(cfg: TrainConfig) -> str:
         # scale -- harmless but misleading. Reset, and recalibrate after training.
         model.config.temperature = 1.0
         model.config.temperature_by_kind = {}
-        model.head = SlotHead(
-            StrandsDeciderModel.hidden_size(model.torso),
-            model.config.num_slots,
-            hidden=cfg.head_hidden,
-            dropout=cfg.head_dropout,
-        ).to(torch.float32)
+        model.head = build_head(model.config, StrandsDeciderModel.hidden_size(model.torso))
         model.freeze_torso()
     else:
         model = StrandsDeciderModel.from_pretrained_base(
@@ -322,11 +319,24 @@ def train(cfg: TrainConfig) -> str:
         )
         if cfg.freeze_torso:
             model.freeze_torso()
+
     if cfg.head_init == "lm_head":
         seeded = model.init_head_from_lm_head()
         print(f"[strands-decider] head seeded from lm_head rows for {seeded} slots")
     elif cfg.head_init != "random":
         raise ValueError(f"unknown head_init {cfg.head_init!r}")
+    return model
+
+
+@distributed.entry_point  # under torchrun, this process is one rank of the run
+def train(cfg: TrainConfig) -> str:
+    rank, _, world = distributed.env()
+    torch.manual_seed(cfg.seed)
+    random.seed(cfg.seed)
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    print(f"[strands-decider] loading base model {cfg.base_model}")
+    model = _build_model(cfg)
     # Checkpointing needs a grad-requiring input; a frozen torso has none, and it
     # buys nothing anyway since no backward pass traverses it.
     if cfg.gradient_checkpointing and not (cfg.freeze_torso or cfg.init_from):

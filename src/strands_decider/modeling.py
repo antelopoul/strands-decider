@@ -92,6 +92,15 @@ class StrandsDeciderConfig:
         with open(path, encoding="utf-8") as fh:
             return cls(**json.load(fh))
 
+    def validate_lm_head_init(self) -> None:
+        """Reject LM-head seeding for readouts that cannot consume its rows."""
+        if self.head_type != "slot" or self.head_hidden != 0:
+            raise ValueError(
+                "head_init='lm_head' requires a linear slot head "
+                "(head_type='slot' and head_hidden=0); "
+                f"got head_type={self.head_type!r}, head_hidden={self.head_hidden}"
+            )
+
 
 class SlotHead(nn.Module):
     """Projects a pooled hidden state to K slot logits.
@@ -387,8 +396,7 @@ class StrandsDeciderModel(nn.Module):
 
     def init_head_from_lm_head(self) -> int:
         """Seed the slot head with the LM's own option-number readout directions."""
-        if self.config.head_hidden:
-            raise ValueError("lm_head init applies to the linear head only")
+        self.config.validate_lm_head_init()
         table = self._output_embedding()
         slots = self.slot_token_ids()
         proj = self.head.proj

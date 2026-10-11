@@ -58,6 +58,97 @@ def ckpt(tmp_path, monkeypatch):
     return path, model, loads
 
 
+def _assert_torso_state_is_preserved(source, continued):
+    source_state = source.torso.state_dict()
+    continued_state = continued.torso.state_dict()
+    assert source_state.keys() == continued_state.keys()
+    assert all(torch.equal(source_state[k], continued_state[k]) for k in source_state)
+
+
+def test_init_from_builds_requested_pointer_head_and_forward_path(ckpt):
+    from strands_decider.modeling import PointerHead
+    from strands_decider.train import TrainConfig, _build_model
+
+    path, source, _ = ckpt
+    model = _build_model(TrainConfig(
+        init_from=str(path),
+        head_type="pointer",
+        num_slots=11,
+        pointer_dim=8,
+        head_dropout=0.1,
+    ))
+
+    assert isinstance(model.head, PointerHead)
+    assert model.config.head_type == "pointer"
+    assert model.config.num_slots == 11
+    assert model.config.pointer_dim == 8
+    assert model.head.q.out_features == 8
+    _assert_torso_state_is_preserved(source, model)
+    assert all(not p.requires_grad for p in model.torso.parameters())
+
+    out = model(
+        input_ids=torch.tensor([[3, 4, 5]]),
+        attention_mask=torch.ones(1, 3, dtype=torch.long),
+        n_slots=torch.tensor([2]),
+        opt_idx=torch.tensor([[0, 1]]),
+    )
+    assert out["logits"].shape == (1, 2)
+
+
+def test_init_from_builds_requested_slot_head_and_forward_path(ckpt):
+    from strands_decider.modeling import SlotHead
+    from strands_decider.train import TrainConfig, _build_model
+
+    path, source, _ = ckpt
+    model = _build_model(TrainConfig(
+        init_from=str(path),
+        head_type="slot",
+        num_slots=7,
+        head_hidden=12,
+        head_dropout=0.2,
+    ))
+
+    assert isinstance(model.head, SlotHead)
+    assert model.config.head_type == "slot"
+    assert model.config.num_slots == 7
+    assert model.config.head_hidden == 12
+    assert model.config.head_dropout == 0.2
+    assert model.head.proj[0].out_features == 12
+    _assert_torso_state_is_preserved(source, model)
+    assert all(not p.requires_grad for p in model.torso.parameters())
+
+    out = model(
+        input_ids=torch.tensor([[3, 4, 5]]),
+        attention_mask=torch.ones(1, 3, dtype=torch.long),
+        n_slots=torch.tensor([4]),
+    )
+    assert out["logits"].shape == (1, 7)
+
+
+def test_lm_head_init_rejects_pointer_and_hidden_slot_heads(ckpt):
+    from strands_decider.modeling import StrandsDeciderConfig
+    from strands_decider.train import TrainConfig, _build_model
+
+    path, model, loads = ckpt
+    message = (
+        "head_init='lm_head' requires a linear slot head "
+        "(head_type='slot' and head_hidden=0); got head_type='pointer', head_hidden=0"
+    )
+    with pytest.raises(ValueError, match="head_init='lm_head' requires a linear slot head") as exc:
+        _build_model(TrainConfig(init_from=str(path), head_type="pointer", head_init="lm_head"))
+    assert str(exc.value) == message
+    assert loads == []
+
+    with pytest.raises(ValueError, match="head_init='lm_head' requires a linear slot head") as exc:
+        model.init_head_from_lm_head()
+    assert str(exc.value) == message
+
+    hidden_config = StrandsDeciderConfig(head_type="slot", head_hidden=8)
+    with pytest.raises(ValueError, match="head_init='lm_head' requires a linear slot head") as exc:
+        hidden_config.validate_lm_head_init()
+    assert str(exc.value).endswith("got head_type='slot', head_hidden=8")
+
+
 def _same(a, b):
     sa, sb = a.state_dict(), b.state_dict()
     return set(sa) == set(sb) and all(torch.equal(sa[k], sb[k]) for k in sa)
